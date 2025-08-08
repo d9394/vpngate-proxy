@@ -1,0 +1,1 @@
+iptables-legacy -t nat -A POSTROUTING -s 10.1.1.0/24 -o tun0 -j MASQUERADE
