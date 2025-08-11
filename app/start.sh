@@ -45,6 +45,9 @@ else
   ip route show
 fi
 
-# 启动 vpngate.py
-python3 -u /app/vpngate.py 2>&1 > /app/vpngate.log
-#tail -f /dev/null
+if [ -n "$DEBUG" ]; then
+  tail -f /dev/null
+else
+  # 启动 vpngate.py
+  python3 -u /app/vpngate.py 2>&1 > /app/vpngate.log
+fi
