@@ -37,6 +37,7 @@ else
   # 删除默认路由
   ip route del default
   echo "已删除默认路由。"$DEFAULT_GW
+  echo $DEFAULT_GW > /app/gateway.txt
   # 添加可用路由
   ip route add 192.168.1.1/32 via $DEFAULT_GW
 
