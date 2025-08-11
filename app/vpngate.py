@@ -247,7 +247,7 @@ def fetch_vpngate_list():
             country_specific_list = [vpn for vpn in all_vpn_list if vpn[6] == country_code]
             
             # 2. 在每个国家/地区内部，按 Ping 值升序排序
-            country_specific_list.sort(key=lambda x: int(x[7]))
+            country_specific_list.sort(key=lambda x: int(x[3]))
 
             final_sorted_list.extend(country_specific_list)
         
