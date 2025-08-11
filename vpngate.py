@@ -21,6 +21,7 @@ DEFAULT_GW = None
 # --- 配置文件与参数 ---
 CONFIG_FILE = 'vpngate.cfg'
 PROXY_FILE = 'proxy.txt'
+GATEWAY_FILE = 'gateway.txt'
 
 # 默认配置
 config = {
@@ -29,10 +30,12 @@ config = {
         'proxy_update_interval_seconds': 3600,
         'network_check_interval_seconds': 300,
         'proxy_test_url': 'https://www.google.com',
-        'ping_check_ip': '8.8.8.8'
+        'ping_check_ip': '8.8.8.8',
+        'vpngate_url': 'http://www.vpngate.net/api/iphone/'
     },
     'vpngate': {
-        'country_codes': 'JP,HK'
+        'country_codes': 'JP,HK',
+        'hostname_filter_keywords': ''
     }
 }
 
@@ -54,6 +57,10 @@ def load_config():
             config[section][key] = value
 
     config['vpngate']['country_codes'] = [code.strip() for code in config['vpngate']['country_codes'].split(',')]
+    
+    # 将关键词字符串编译为正则表达式对象
+    filter_patterns = [keyword.strip() for keyword in config['vpngate']['hostname_filter_keywords'].split(',') if keyword.strip()]
+    config['vpngate']['hostname_filter_patterns'] = [re.compile(pattern, re.IGNORECASE) for pattern in filter_patterns]
 
 def log_print(message):
     """带时间戳地打印信息。"""
@@ -73,9 +80,59 @@ def get_current_proxy():
     CURRENT_PROXY = None
     return None
 
+def read_default_gateway():
+    """从文件中读取默认网关IP。"""
+    global DEFAULT_GW
+    if os.path.exists(GATEWAY_FILE):
+        with open(GATEWAY_FILE, 'r') as f:
+            gw_ip = f.readline().strip()
+            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', gw_ip):
+                DEFAULT_GW = gw_ip
+                log_print(f"已从 {GATEWAY_FILE} 文件中读取系统网关IP：{DEFAULT_GW}")
+                return True
+    
+    log_print(f"错误：未找到有效的系统网关IP。请在 {GATEWAY_FILE} 文件中写入正确的IP地址。")
+    return False
+
+def add_route_for_proxy(proxy_ip):
+    """为代理IP添加路由规则，通过默认网关。"""
+    if not DEFAULT_GW:
+        log_print("无法添加路由：系统网关IP未设置。")
+        return False
+    
+    try:
+        command = ['ip', 'route', 'add', proxy_ip, 'via', DEFAULT_GW]
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_print(f"已为代理IP {proxy_ip} 添加路由规则。")
+        return True
+    except subprocess.CalledProcessError as e:
+        log_print(f"添加路由失败：{e}")
+        return False
+    except Exception as e:
+        log_print(f"添加路由时发生未知错误：{e}")
+        return False
+
+def delete_route_for_proxy(proxy_ip):
+    """删除为代理IP添加的路由规则。"""
+    if not DEFAULT_GW:
+        log_print("无法删除路由：系统网关IP未设置。")
+        return False
+
+    try:
+        command = ['ip', 'route', 'del', proxy_ip]
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_print(f"已删除代理IP {proxy_ip} 的路由规则。")
+        return True
+    except subprocess.CalledProcessError as e:
+        log_print(f"删除路由失败：{e}")
+        return False
+    except Exception as e:
+        log_print(f"删除路由时发生未知错误：{e}")
+        return False
+
 def validate_proxies():
     """
-    验证代理列表中的每个代理，生成有效的代理字典列表。
+    验证代理列表中的每个代理，生成有效的代理字典列表，并按响应速度排序。
     """
     global PROXY_LIST
     validated_list = []
@@ -99,18 +156,37 @@ def validate_proxies():
             elif proxy_line.startswith('http://'):
                 proxies = {'http': proxy_line, 'https': proxy_line}
 
+            match = re.search(r'://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)', proxy_line)
+            if not match:
+                log_print(f"代理验证线程：代理格式错误，跳过：{proxy_line}")
+                continue
+            
+            proxy_ip = match.group(1)
+            
+            # 1. 添加路由
+            add_route_for_proxy(proxy_ip)
+            
+            # 2. 验证代理
             try:
+                start_time = time.time()
                 response = requests.get(config['general']['proxy_test_url'], proxies=proxies, timeout=10)
+                end_time = time.time()
+                latency = round((end_time - start_time) * 1000, 2)
+                
                 if response.status_code == 200:
-                    validated_list.append(proxies)
-                    log_print(f"代理验证线程：代理 {proxy_line} 验证成功。")
+                    validated_list.append({'proxies': proxies, 'latency': latency})
+                    log_print(f"代理验证线程：代理 {proxy_line} 验证成功，耗时：{latency}ms。路由已保留。")
                 else:
                     log_print(f"代理验证线程：代理 {proxy_line} 验证失败，状态码：{response.status_code}。")
+                    delete_route_for_proxy(proxy_ip)
             except Exception as e:
                 log_print(f"代理验证线程：代理 {proxy_line} 验证失败，错误：{e}。")
+                delete_route_for_proxy(proxy_ip)
 
-        PROXY_LIST = validated_list
-        log_print(f"代理验证线程：验证完成，共有 {len(PROXY_LIST)} 个有效代理。")
+        # 根据耗时排序
+        validated_list.sort(key=lambda x: x['latency'])
+        PROXY_LIST = [item['proxies'] for item in validated_list]
+        log_print(f"代理验证线程：验证完成，共有 {len(PROXY_LIST)} 个有效代理，已按速度排序。")
 
 # --- VPN Gate 列表 ---
 
@@ -132,32 +208,54 @@ def check_network():
 def fetch_vpngate_list():
     """从 VPN Gate 获取服务器列表并格式化。"""
     global VPN_GATE_LIST
-    url = 'http://www.vpngate.net/api/iphone/'
+    url = config['general']['vpngate_url']
     try:
         proxies = get_current_proxy()
         log_print("获取VPN列表线程：正在获取VPN Gate列表...")
         response = requests.get(url, proxies=proxies, timeout=30)
-        
+
         if response.status_code != 200 or not response.text:
             log_print("获取VPN列表线程：获取列表失败。")
             return
-            
+
         lines = response.text.split('\n')
         
-        filtered_list = []
-        country_codes = config['vpngate']['country_codes']
+        all_vpn_list = []
+        filter_patterns = config['vpngate']['hostname_filter_patterns']
+
         for line in lines[2:-1]:
             parts = line.split(',')
             if len(parts) >= 8:
-                country_code = parts[6]
-                if country_code in country_codes:
-                    filtered_list.append(parts)
+                hostname = parts[0]
+                
+                # Check for hostname filter using regex
+                is_filtered = False
+                for pattern in filter_patterns:
+                    if pattern.search(hostname):
+                        log_print(f"获取VPN列表线程：跳过VPN [{hostname}]，因其主机名匹配正则模式：'{pattern.pattern}'。")
+                        is_filtered = True
+                        break
+                
+                if not is_filtered:
+                    all_vpn_list.append(parts)
 
-        filtered_list.sort(key=lambda x: int(x[7]), reverse=True)
+        final_sorted_list = []
+        country_codes = config['vpngate']['country_codes']
+
+        # 1. 根据 country_codes 优先级排序
+        for country_code in country_codes:
+            country_specific_list = [vpn for vpn in all_vpn_list if vpn[6] == country_code]
+            
+            # 2. 在每个国家/地区内部，按 Ping 值升序排序
+            country_specific_list.sort(key=lambda x: int(x[7]))
+
+            final_sorted_list.extend(country_specific_list)
         
         with VPN_LIST_LOCK:
-            VPN_GATE_LIST = filtered_list
+            VPN_GATE_LIST = final_sorted_list
+        
         log_print(f"获取VPN列表线程：已成功获取并更新VPN列表，共有{len(VPN_GATE_LIST)}条记录。")
+        log_print("获取VPN列表线程：VPN列表已按配置文件中的国家/地区和Ping值排序。")
 
     except Exception as e:
         log_print(f"获取VPN列表线程：获取列表失败，错误：{e}")
@@ -289,20 +387,23 @@ def main_thread_loop():
 def vpn_list_thread_loop():
     """获取VPN列表线程循环，定期更新列表。"""
     while True:
-        time.sleep(int(config['general']['vpngate_update_interval_seconds']))
         load_config()
         fetch_vpngate_list()
-        
+        time.sleep(int(config['general']['vpngate_update_interval_seconds']))
+
 def proxy_list_thread_loop():
     """代理列表线程循环，定期更新并验证代理。"""
     while True:
-        time.sleep(int(config['general']['proxy_update_interval_seconds']))
         load_config()
         validate_proxies()
-        
+        time.sleep(int(config['general']['proxy_update_interval_seconds']))
+
 # --- 主程序入口 ---
 if __name__ == '__main__':
     load_config()
+    if not read_default_gateway():
+        exit(1)
+
     validate_proxies()
     
     if not PROXY_LIST:
