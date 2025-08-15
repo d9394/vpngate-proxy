@@ -12,6 +12,7 @@ import re
 # 全局变量
 VPN_GATE_LIST = []
 PROXY_LIST = []
+LOCAL_PROXY_LIST = []
 VPN_LIST_LOCK = threading.Lock()
 PROXY_LIST_LOCK = threading.Lock()
 OPENVPN_PROCESS = None
@@ -35,11 +36,17 @@ config = {
         'network_check_interval_seconds': 300,
         'proxy_test_url': 'https://www.google.com',
         'ping_check_ip': '8.8.8.8',
-        'vpngate_url': 'http://www.vpngate.net/api/iphone/'
+        'vpngate_url': 'http://www.vpngate.net/api/iphone/',
+        'proxy_retry_count': 3,
+        'proxy_retry_delay_seconds': 1
     },
     'vpngate': {
         'country_codes': 'JP,HK',
         'hostname_filter_keywords': ''
+    },
+    'local_proxies': {
+        'enable': 'yes',
+        'proxies': 'socks5h://192.168.1.1:3128, socks5h://192.168.3.1:3128, http://192.168.1.1:8888'
     }
 }
 
@@ -51,12 +58,15 @@ def log_print(message):
 # --- 网络与代理 ---
 
 def get_current_proxy():
-    """从代理列表中获取当前可用的代理字典。"""
-    global CURRENT_PROXY
+    """根据优先级获取当前可用的代理字典。"""
+    global CURRENT_PROXY, PROXY_LIST, LOCAL_PROXY_LIST
     with PROXY_LIST_LOCK:
         if PROXY_LIST:
             CURRENT_PROXY = PROXY_LIST[0]
             return PROXY_LIST[0]
+        elif LOCAL_PROXY_LIST:
+            CURRENT_PROXY = LOCAL_PROXY_LIST[0]
+            return LOCAL_PROXY_LIST[0]
     
     CURRENT_PROXY = None
     return None
@@ -111,47 +121,47 @@ def delete_route_for_proxy(proxy_ip):
         log_print(f"删除路由时发生未知错误：{e}")
         return False
 
-def validate_proxies():
+def test_proxies(proxy_lines, source_name):
     """
     验证代理列表中的每个代理，生成有效的代理字典列表，并按响应速度排序。
+    引入重试机制，以应对不稳定的代理。
     """
-    global PROXY_LIST
     validated_list = []
-    # 使用一个集合来跟踪所有成功验证的代理IP
     successful_ips = set()
     
-    with PROXY_LIST_LOCK:
-        raw_proxy_list = []
-        if os.path.exists(PROXY_FILE):
-            with open(PROXY_FILE, 'r') as f:
-                raw_proxy_list = [line.strip() for line in f.readlines() if line.strip()]
-
-        if not raw_proxy_list:
-            log_print("代理验证线程：代理文件为空或未找到，跳过验证。")
-            PROXY_LIST = []
-            return
+    # 从配置文件中读取重试次数和每次重试的延迟
+    retry_count = int(config['general']['proxy_retry_count'])
+    retry_delay_seconds = int(config['general']['proxy_retry_delay_seconds'])
+    
+    log_print(f"代理验证线程：开始验证来自 {source_name} 的 {len(proxy_lines)} 个代理。")
+    
+    for proxy_line in proxy_lines:
+        if proxy_line.startswith(('#', ';')):
+            continue
         
-        log_print(f"代理验证线程：开始验证 {len(raw_proxy_list)} 个代理。")
-        
-        for proxy_line in raw_proxy_list:
-            if proxy_line.startswith(('#', ';')):
-                continue
-            
-            proxies = {}
-            if proxy_line.startswith('socks'):
-                proxy_url = re.sub(r'socks(5h|5)?://', 'socks5h://', proxy_line)
-                proxies = {'http': proxy_url, 'https': proxy_url}
-            elif proxy_line.startswith('http://'):
-                proxies = {'http': proxy_line, 'https': proxy_line}
+        proxies = {}
+        if proxy_line.startswith('socks4://'):
+            proxy_url = proxy_line
+            proxies = {'http': proxy_url, 'https': proxy_url}
+        elif proxy_line.startswith('socks://') or proxy_line.startswith('socks5://') or proxy_line.startswith('socks5h://'):
+            proxy_url = re.sub(r'socks(5h|5)?://', 'socks5h://', proxy_line)
+            proxies = {'http': proxy_url, 'https': proxy_url}
+        elif proxy_line.startswith('http://'):
+            proxies = {'http': proxy_line, 'https': proxy_line}
+        else:
+            log_print(f"代理验证线程：代理格式不支持，跳过：{proxy_line}")
+            continue
 
-            match = re.search(r'://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)', proxy_line)
-            if not match:
-                log_print(f"代理验证线程：代理格式错误，跳过：{proxy_line}")
-                continue
-            
-            proxy_ip = match.group(1)
-            add_route_for_proxy(proxy_ip)
-            
+        match = re.search(r'://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)', proxy_line)
+        if not match:
+            log_print(f"代理验证线程：代理格式错误，跳过：{proxy_line}")
+            continue
+        
+        proxy_ip = match.group(1)
+        add_route_for_proxy(proxy_ip)
+        
+        is_successful = False
+        for attempt in range(1, retry_count + 1):
             try:
                 start_time = time.time()
                 response = requests.get(config['general']['proxy_test_url'], proxies=proxies, timeout=10)
@@ -159,25 +169,56 @@ def validate_proxies():
                 
                 if response.status_code == 200 and "<title>Google</title>" in response.text:
                     validated_list.append({'proxies': proxies, 'latency': latency})
-                    # 将成功的IP加入集合，确保它的路由不会被删除
                     successful_ips.add(proxy_ip)
-                    log_print(f"代理验证线程：代理 {proxy_line} 验证成功，耗时：{latency}ms。")
+                    log_print(f"代理验证线程：来自 {source_name} 的代理 {proxy_line} 第 {attempt} 次尝试验证成功，耗时：{latency}ms。")
+                    is_successful = True
+                    break
                 else:
-                    log_print(f"代理验证线程：代理 {proxy_line} 验证失败，状态码：{response.status_code}。")
+                    log_print(f"代理验证线程：来自 {source_name} 的代理 {proxy_line} 第 {attempt} 次尝试验证失败，状态码：{response.status_code}。")
             except Exception as e:
-                log_print(f"代理验证线程：代理 {proxy_line} 验证失败，错误：{e}。")
-
-        # 遍历所有原始代理行，仅删除那些其IP没有在成功集合中的路由
-        all_unique_ips = {re.search(r'://(\d+\.\d+\.\d+\.\d+):', line).group(1) for line in raw_proxy_list if re.search(r'://(\d+\.\d+\.\d+\.\d+):', line)}
+                log_print(f"代理验证线程：来自 {source_name} 的代理 {proxy_line} 第 {attempt} 次尝试验证失败，错误：{e}。")
+            
+            if attempt < retry_count:
+                time.sleep(retry_delay_seconds)
         
-        for ip in all_unique_ips:
-            if ip not in successful_ips:
-                delete_route_for_proxy(ip)
+        if not is_successful:
+            delete_route_for_proxy(proxy_ip)
+        
+    all_unique_ips = {re.search(r'://(\d+\.\d+\.\d+\.\d+):', line).group(1) for line in proxy_lines if re.search(r'://(\d+\.\d+\.\d+\.\d+):', line)}
+    for ip in all_unique_ips:
+        if ip not in successful_ips:
+            delete_route_for_proxy(ip)
+    
+    return validated_list
 
-        validated_list.sort(key=lambda x: x['latency'])
-        PROXY_LIST = [item['proxies'] for item in validated_list]
-        log_print(f"代理验证线程：验证完成，共有 {len(PROXY_LIST)} 个有效代理，已按速度排序。")
+def validate_proxies():
+    """
+    验证代理列表中的每个代理，生成有效的代理字典列表，并按响应速度排序。
+    将 proxy.txt 和本地代理分开验证和排序。
+    """
+    global PROXY_LIST, LOCAL_PROXY_LIST
+    
+    with PROXY_LIST_LOCK:
+        raw_proxy_list = []
+        if os.path.exists(PROXY_FILE):
+            with open(PROXY_FILE, 'r') as f:
+                raw_proxy_list = [line.strip() for line in f.readlines() if line.strip()]
 
+        validated_list_from_file = test_proxies(raw_proxy_list, "proxy.txt")
+        validated_list_from_file.sort(key=lambda x: x['latency'])
+        PROXY_LIST = [item['proxies'] for item in validated_list_from_file]
+        log_print(f"代理验证线程：proxy.txt 验证完成，共有 {len(PROXY_LIST)} 个有效代理，已按速度排序。")
+
+        local_proxy_list = []
+        if config['local_proxies']['enable'].lower() == 'yes':
+            local_proxies_str = config['local_proxies'].get('proxies', '')
+            local_proxy_list = config['local_proxies']['proxies']
+        
+        validated_list_from_local = test_proxies(local_proxy_list, "本地代理配置")
+        validated_list_from_local.sort(key=lambda x: x['latency'])
+        LOCAL_PROXY_LIST = [item['proxies'] for item in validated_list_from_local]
+        log_print(f"代理验证线程：本地代理验证完成，共有 {len(LOCAL_PROXY_LIST)} 个有效代理，已按速度排序。")
+        
 # --- VPN Gate 列表 ---
 
 def check_network():
@@ -200,7 +241,15 @@ def fetch_vpngate_list():
     global VPN_GATE_LIST
     url = config['general']['vpngate_url']
     try:
-        proxies = get_current_proxy()
+        proxies = None
+        if config['local_proxies']['enable'].lower() == 'yes' and LOCAL_PROXY_LIST:
+            proxies = LOCAL_PROXY_LIST[0]
+            log_print(f"获取VPN列表线程：优先使用最快的本地代理 {proxies.get('http', '')}...")
+        
+        if not proxies:
+            proxies = get_current_proxy()
+            log_print("获取VPN列表线程：使用代理列表中的代理...")
+
         if not proxies:
             log_print("获取VPN列表线程：无可用代理，无法获取VPN列表。")
             return
@@ -222,7 +271,6 @@ def fetch_vpngate_list():
             if len(parts) >= 8:
                 hostname = parts[0]
                 
-                # Check for hostname filter using regex
                 is_filtered = False
                 for pattern in filter_patterns:
                     if pattern.search(hostname):
@@ -236,12 +284,10 @@ def fetch_vpngate_list():
         final_sorted_list = []
         country_codes = config['vpngate']['country_codes']
 
-        # 1. 根据 country_codes 优先级排序
         for country_code in country_codes:
             country_specific_list = [vpn for vpn in all_vpn_list if vpn[6] == country_code]
             log_print(f"{country_code}共有{len(country_specific_list)}条记录")
             
-            # 2. 在每个国家/地区内部，按 Ping 值升序排序
             def get_ping_value(vpn_entry):
                 try:
                     return int(vpn_entry[3])
@@ -356,11 +402,33 @@ def connect_openvpn():
             if check_network():
                 log_print(f"OpenVPN连接线程：连接成功，VPN [{vpn_info[0]}] 正常工作。")
                 
-                # --- 发送 HTTP 请求 ---
+                proxy_str = "N/A"
+                if os.path.exists(ovpn_file):
+                    try:
+                        with open(ovpn_file, 'r') as f:
+                            content = f.read()
+                        
+                        socks_match = re.search(r'socks-proxy\s+(\S+)\s+(\S+)', content)
+                        http_match = re.search(r'http-proxy\s+(\S+)\s+(\S+)', content)
+                        
+                        if socks_match:
+                            ip, port = socks_match.groups()
+                            proxy_str = f"socks://{ip}:{port}"
+                        elif http_match:
+                            ip, port = http_match.groups()
+                            proxy_str = f"http://{ip}:{port}"
+                            
+                    except Exception as e:
+                        log_print(f"OpenVPN连接线程：读取配置文件失败，错误：{e}")
+                
                 try:
-                    url = f"http://192.168.1.1:8001/?usr=test&msg=已连接{vpn_info[0]}({vpn_info[6]}){vpn_info[3]}ms&from=VPNGATE"
-                    log_print(f"OpenVPN连接线程：发送连接成功通知到 {url}")
-                    requests.get(url, timeout=5)
+                    url_msg = f"已连接{vpn_info[0]}({vpn_info[6]}){vpn_info[3]}ms"
+                    url_proxy_info = f"通过代理{proxy_str}"
+                    
+                    full_url = f"http://192.168.103.1:8001/?usr=test&msg={url_msg}{url_proxy_info}&from=VPNGATE"
+                    
+                    log_print(f"OpenVPN连接线程：发送连接成功通知到 {full_url}")
+                    requests.get(full_url, timeout=5)
                 except requests.exceptions.RequestException as e:
                     log_print(f"OpenVPN连接线程：发送通知失败，错误：{e}")
                 
@@ -375,9 +443,9 @@ def connect_openvpn():
             if OPENVPN_PROCESS:
                 OPENVPN_PROCESS.terminate()
                 OPENVPN_PROCESS = None
-        #finally:
-        #    if os.path.exists(ovpn_file):
-        #        os.remove(ovpn_file)
+        finally:
+            if os.path.exists(ovpn_file):
+                os.remove(ovpn_file)
 
     log_print("OpenVPN连接线程：所有VPN记录都连接失败。")
 
@@ -391,8 +459,9 @@ def load_config():
         config_parser.read(CONFIG_FILE)
         log_print("已成功加载 vpngate.cfg 配置文件。")
     else:
-        config_parser['general'] = config['general']
+        config_parser['general'] = {k: str(v) for k, v in config['general'].items()}
         config_parser['vpngate'] = config['vpngate']
+        config_parser['local_proxies'] = config['local_proxies'] 
         with open(CONFIG_FILE, 'w') as f:
             config_parser.write(f)
         log_print(f"配置文件 {CONFIG_FILE} 不存在，已创建默认文件。")
@@ -405,7 +474,18 @@ def load_config():
     filter_patterns = [keyword.strip() for keyword in config['vpngate']['hostname_filter_keywords'].split(',') if keyword.strip()]
     config['vpngate']['hostname_filter_patterns'] = [re.compile(pattern, re.IGNORECASE) for pattern in filter_patterns]
     
-    # 更新最后修改时间
+    local_proxies_str = config['local_proxies'].get('proxies', '')
+    config['local_proxies']['proxies'] = [p.strip() for p in local_proxies_str.split(',') if p.strip()]
+
+    # 将新配置项转换为整数类型
+    try:
+        config['general']['proxy_retry_count'] = int(config['general']['proxy_retry_count'])
+        config['general']['proxy_retry_delay_seconds'] = int(config['general']['proxy_retry_delay_seconds'])
+    except (ValueError, KeyError) as e:
+        log_print(f"警告：配置文件中代理重试参数格式错误，将使用默认值。错误：{e}")
+        config['general']['proxy_retry_count'] = 3
+        config['general']['proxy_retry_delay_seconds'] = 1
+
     LAST_CONFIG_MOD_TIME = os.path.getmtime(CONFIG_FILE)
 
 def main_thread_loop():
@@ -426,7 +506,6 @@ def vpn_list_thread_loop():
         time.sleep(int(config['general']['vpngate_update_interval_seconds']))
         try:
             current_mod_time = os.path.getmtime(CONFIG_FILE)
-            # 如果文件修改时间发生变化或首次运行
             if current_mod_time > LAST_CONFIG_MOD_TIME:
                 log_print("配置线程：检测到 vpngate.cfg 文件有变动，重新加载配置。")
                 load_config()
@@ -441,7 +520,6 @@ def proxy_list_thread_loop():
         time.sleep(int(config['general']['proxy_update_interval_seconds']))
         try:
             current_mod_time = os.path.getmtime(PROXY_FILE)
-            # 如果文件修改时间发生变化或首次运行
             if current_mod_time > LAST_PROXY_MOD_TIME:
                 log_print("代理线程：检测到 proxy.txt 文件有变动，重新验证代理。")
                 validate_proxies()
@@ -458,8 +536,8 @@ if __name__ == '__main__':
 
     validate_proxies()
     
-    if not PROXY_LIST:
-        log_print("程序启动：未找到有效代理，程序退出。请检查 proxy.txt 文件。")
+    if not PROXY_LIST and not LOCAL_PROXY_LIST:
+        log_print("程序启动：未找到有效代理，程序退出。请检查 proxy.txt 文件和 vpngate.cfg 中的本地代理配置。")
         exit(1)
     
     log_print("程序启动，正在初始化线程...")
