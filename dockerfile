@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1
 # 3proxy: 从 edge/testing 仓库获取
 RUN echo "http://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories && \
     apk update && \
-    apk add --no-cache iptables iptables-legacy openvpn python3 bash 3proxy traceroute tcpdump py3-requests py3-pysocks && \
+    apk add --no-cache iptables iptables-legacy openvpn python3 bash 3proxy traceroute tcpdump py3-requests py3-pysocks fping && \
     rm -rf /var/cache/apk/*
 
 # 将工作目录设置为 /app
