@@ -477,7 +477,7 @@ def start_continuous_ping():
     
     try:
         PING_PROCESS = subprocess.Popen(
-            ['ping', host, '-i', '1'], 
+            ['fping', '-l', '-p', '1000', host], 
             stdout=subprocess.PIPE, 
             stderr=subprocess.STDOUT, 
             text=True, 
@@ -510,7 +510,7 @@ def ping_output_reader_thread():
                 time.sleep(0.1)
                 continue
 
-            match = re.search(r'time=(\d+\.?\d*) ms', line)
+            match = re.search(r':\s*(\d+\.?\d*)\s*ms', line)
             
             with NETWORK_HEALTH_LOCK:
                 if match:
