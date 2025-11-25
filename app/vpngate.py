@@ -8,15 +8,12 @@ import signal
 import base64
 import configparser
 import re
+import socket # NEW: For ICMP/Socket ping
+import struct # NEW: For packing/unpacking ICMP packets
+import select # NEW: For socket timeout on receiving
+import random # NEW: For ICMP ID
 
-# --- 纯 Python ICMP PING 相关的导入 ---
-import struct
-import select
-import sys
-import socket # 确保 socket 模块被导入
-# -----------------------------------
-
-# 全局变量
+# --- 全局状态和锁 ---
 VPN_GATE_LIST = []
 PROXY_LIST = []
 LOCAL_PROXY_LIST = []
@@ -25,41 +22,40 @@ PROXY_LIST_LOCK = threading.Lock()
 OPENVPN_PROCESS = None
 CURRENT_PROXY = None
 DEFAULT_GW = None
-config = {} # config 定义为全局变量，用于存储配置
+
+# 关键锁：确保同一时间只有一个连接/清理流程在运行
+OPENVPN_CONNECT_LOCK = threading.Lock() 
+
+# --- 网络监控全局变量 (由持续ICMP Ping线程更新) ---
+NETWORK_HEALTH_LOCK = threading.Lock()
+NETWORK_HEALTH_STATUS = False # False means no connection or error, float means latency
+# PING_PROCESS = None # REMOVED: Using ICMP_RUNNING/ICMP_THREAD instead
+ICMP_RUNNING = False # NEW: Flag to control the ICMP monitoring thread
+ICMP_THREAD = None   # NEW: Reference to the monitoring thread
 
 # 文件修改时间记录
 LAST_CONFIG_MOD_TIME = 0
 LAST_PROXY_MOD_TIME = 0
-
-# 调试/监控全局变量
-NETWORK_FAILURE_COUNT = 0 # 连续网络失败计数
-
-# ICMP 报文常量
-ICMP_ECHO_REQUEST = 8 
-ICMP_ECHO_REPLY = 0 
-PACKET_SIZE = 64 # ICMP 报文主体长度
 
 # --- 配置文件与参数 ---
 CONFIG_FILE = 'vpngate.cfg'
 PROXY_FILE = 'proxy.txt'
 GATEWAY_FILE = 'gateway.txt'
 
-# 默认配置
-DEFAULT_CONFIG = {
+# 默认配置 (新增 debug 选项)
+config = {
     'general': {
-        'vpngate_update_interval_seconds': '3600',
-        'proxy_update_interval_seconds': '300',
-        'network_check_interval_seconds': '300',
-        'config_check_interval_seconds': '300',
-        'proxy_test_url': 'https://www.google.com',
+        'vpngate_update_interval_seconds': 3600,
+        'proxy_update_interval_seconds': 300,
+        'network_checker_interval_seconds': 30,
+        'config_check_interval_seconds': 300,
+        'proxy_test_url': 'https://www.google.com', 
         'ping_check_ip': '8.8.8.8',
         'vpngate_url': 'http://www.vpngate.net/api/iphone/',
-        'proxy_retry_count': '3',
-        'proxy_retry_delay_seconds': '1',
-        'proxy_max_retries': '5', 
-        'debug_mode': 'no', 
-        'monitor_ping_interval_seconds': '10', 
-        'monitor_max_failures': '5' 
+        'proxy_retry_count': 3,
+        'proxy_retry_delay_seconds': 1,
+        'proxy_max_retries': 5, 
+        'debug': 'false', # <-- 新增 DEBUG 模式开关
     },
     'vpngate': {
         'country_codes': 'JP,HK',
@@ -71,174 +67,23 @@ DEFAULT_CONFIG = {
     }
 }
 
-def log_print(message, is_debug=False):
+def log_print(message, force_print=False):
     """
     带时间戳地打印信息。
-    如果 is_debug 为 True，则只有在 config['general']['debug_mode'] 开启时才打印。
+    :param message: 要打印的消息。
+    :param force_print: 如果为 True，则忽略 debug 配置强制打印。
     """
-    global config
     
-    # 只有在 config 字典已加载时才进行判断
-    if config: 
-        if is_debug:
-            # 检查配置中的 debug_mode 是否为 'yes' (不区分大小写)
-            debug_enabled = config['general'].get('debug_mode', 'no').lower() == 'yes'
-            if not debug_enabled:
-                return
+    # 检查 debug 配置是否开启 (容错处理)
+    is_debug_enabled = config['general'].get('debug', 'false').lower() in ('true', 'yes', '1')
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S")
-    print(f"[{timestamp}] {message}")
+    if force_print or is_debug_enabled:
+        timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S")
+        print(f"[{timestamp}] {message}")
 
-# --- 纯 Python ICMP Ping 实现 (替代系统 ping) ---
-
-def checksum(source_string):
-    """
-    计算 ICMP 校验和。
-    """
-    sum_val = 0
-    # ... (ICMP checksum logic remains the same)
-    max_count = (len(source_string) // 2) * 2
-    count = 0
-    while count < max_count:
-        # Python 3 compatibility: struct.unpack returns a tuple
-        val = source_string[count + 1] * 256 + source_string[count]
-        sum_val = sum_val + val
-        sum_val = sum_val & 0xffffffff
-        count += 2
-
-    if max_count < len(source_string):
-        sum_val += source_string[len(source_string) - 1]
-        sum_val = sum_val & 0xffffffff
-
-    sum_val = (sum_val >> 16) + (sum_val & 0xffff)
-    sum_val = sum_val + (sum_val >> 16)
-    answer = ~sum_val
-    answer = answer & 0xffff
-    answer = answer >> 8 | (answer << 8 & 0xff00)
-    return answer
-
-def pure_python_icmp_ping(host, timeout=1):
-    """
-    使用原始 socket 发送和接收 ICMP Echo 报文，测量延迟。
-    注意：在 Linux/Unix 上通常需要 root 权限 (CAP_NET_RAW capability) 才能创建 raw socket。
-    返回: 延迟（毫秒）或 None。
-    """
-    try:
-        # 尝试使用 AF_INET 协议族和 IPPROTO_ICMP 协议创建 raw socket
-        # 需要 root 权限
-        icmp_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-    except socket.error as e:
-        if e.errno == 1:
-             log_print("ICMP Ping 错误：创建 raw socket 需要 root/管理员权限。请以 root 运行脚本。")
-        else:
-            log_print(f"ICMP Ping 错误：创建 socket 失败：{e}")
-        return None
-    except Exception as e:
-        log_print(f"ICMP Ping 错误：{e}")
-        return None
-        
-    icmp_socket.settimeout(timeout)
-    
-    my_id = os.getpid() & 0xFFFF
-    my_seq = int((time.time() * 1000) % 65535)
-    
-    data = (PACKET_SIZE - 8) * b'Q' 
-    
-    header = struct.pack('!bbHHh', ICMP_ECHO_REQUEST, 0, 0, my_id, my_seq) 
-    
-    my_checksum = checksum(header + data)
-    
-    header = struct.pack('!bbHHh', ICMP_ECHO_REQUEST, 0, my_checksum, my_id, my_seq) 
-    packet = header + data
-
-    try:
-        dest_addr = socket.gethostbyname(host)
-        
-        time_sent = time.time()
-        icmp_socket.sendto(packet, (dest_addr, 1)) 
-        
-        ready = select.select([icmp_socket], [], [], timeout)
-        time_received = time.time()
-        
-        if ready[0] == []:
-            icmp_socket.close()
-            return None
-        
-        rec_packet, addr = icmp_socket.recvfrom(1024)
-        icmp_socket.close()
-
-        icmp_header = rec_packet[20:28] 
-        type, code, checksum_rcv, id_rcv, seq_rcv = struct.unpack('!bbHHh', icmp_header)
-
-        if type == ICMP_ECHO_REPLY and id_rcv == my_id:
-            latency = (time_received - time_sent) * 1000 # 转换为毫秒
-            return latency
-        else:
-            return None
-
-    except socket.gaierror as e:
-        log_print(f"ICMP Ping 错误：无法解析主机名 {host}：{e}", is_debug=False)
-        return None
-    except Exception as e:
-        log_print(f"ICMP Ping 过程中发生错误：{e}", is_debug=True)
-        return None
-
-# --- 监控线程 (Continuous Ping) ---
-
-def vpn_monitor_thread_loop():
-    # ... (function body remains the same, relies on check_network which uses ICMP)
-    """
-    VPN 连接状态监控线程，定期检查网络连通性。
-    如果连续失败次数达到阈值，则强制终止 OpenVPN 进程。
-    """
-    global OPENVPN_PROCESS, NETWORK_FAILURE_COUNT, config
-    
-    try:
-        monitor_interval = int(config['general'].get('monitor_ping_interval_seconds', '10'))
-        max_failures = int(config['general'].get('monitor_max_failures', '5'))
-    except ValueError:
-        log_print("警告：VPN监控配置参数格式错误，使用默认值(间隔10s, 失败5次)。")
-        monitor_interval = 10
-        max_failures = 5
-
-    while True:
-        time.sleep(monitor_interval) 
-        
-        if OPENVPN_PROCESS and OPENVPN_PROCESS.poll() is None:
-            log_print("VPN监控线程：正在进行连接状态检查...")
-            
-            if check_network(timeout=5): 
-                if NETWORK_FAILURE_COUNT > 0:
-                     log_print(f"VPN监控线程：网络恢复正常。")
-                NETWORK_FAILURE_COUNT = 0
-            else:
-                NETWORK_FAILURE_COUNT += 1
-                log_print(f"VPN监控线程：连接检查失败 ({NETWORK_FAILURE_COUNT}/{max_failures})！")
-
-                if NETWORK_FAILURE_COUNT >= max_failures:
-                    log_print(f"VPN监控线程：连续 {max_failures} 次检查失败，认为VPN连接已断开或失效，强制终止进程。")
-                    
-                    try:
-                        pgid = os.getpgid(OPENVPN_PROCESS.pid)
-                        os.killpg(pgid, signal.SIGKILL)
-                        OPENVPN_PROCESS.wait(timeout=5)
-                        log_print("VPN监控线程：已强制终止 OpenVPN 进程。")
-                    except Exception as e:
-                        log_print(f"VPN监控线程：强制终止进程失败: {e}")
-                        
-                    OPENVPN_PROCESS = None
-                    NETWORK_FAILURE_COUNT = 0
-        else:
-            if OPENVPN_PROCESS is None and NETWORK_FAILURE_COUNT > 0:
-                NETWORK_FAILURE_COUNT = 0
-            
-            log_print("VPN监控线程：当前无活动 OpenVPN 进程。")
-
-
-# --- 网络与代理 ---
+# --- 路由和代理辅助函数 ---
 
 def get_current_proxy():
-# ... (function body remains the same)
     """根据优先级获取当前可用的代理字典。"""
     global CURRENT_PROXY, PROXY_LIST, LOCAL_PROXY_LIST
     with PROXY_LIST_LOCK:
@@ -253,7 +98,6 @@ def get_current_proxy():
     return None
 
 def read_default_gateway():
-# ... (function body remains the same)
     """从文件中读取默认网关IP。"""
     global DEFAULT_GW
     if os.path.exists(GATEWAY_FILE):
@@ -264,14 +108,13 @@ def read_default_gateway():
                 log_print(f"已从 {GATEWAY_FILE} 文件中读取系统网关IP：{DEFAULT_GW}")
                 return True
     
-    log_print(f"错误：未找到有效的系统网关IP。请在 {GATEWAY_FILE} 文件中写入正确的IP地址。")
+    log_print(f"错误：未找到有效的系统网关IP。请在 {GATEWAY_FILE} 文件中写入正确的IP地址。", force_print=True)
     return False
 
 def add_route_for_proxy(proxy_ip):
-# ... (function body remains the same)
     """为代理IP添加路由规则，通过默认网关，并检测是否成功。"""
     if not DEFAULT_GW:
-        log_print("无法添加路由：系统网关IP未设置。")
+        log_print("无法添加路由：系统网关IP未设置。", force_print=True)
         return False
     
     try:
@@ -297,14 +140,12 @@ def add_route_for_proxy(proxy_ip):
         return False
         
     except Exception as e:
-        log_print(f"添加路由时发生未知错误：{e}")
+        log_print(f"添加路由时发生未知错误：{e}", force_print=True)
         return False
 
 def delete_route_for_proxy(proxy_ip):
-# ... (function body remains the same)
     """删除为代理IP添加的路由规则。"""
     if not DEFAULT_GW:
-        log_print("无法删除路由：系统网关IP未设置。")
         return False
 
     try:
@@ -312,16 +153,13 @@ def delete_route_for_proxy(proxy_ip):
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log_print(f"已删除代理IP {proxy_ip} 的路由规则。")
         return True
-    except subprocess.CalledProcessError as e:
-        log_print(f"删除路由失败：{e}")
+    except subprocess.CalledProcessError:
         return False
     except Exception as e:
         log_print(f"删除路由时发生未知错误：{e}")
         return False
 
-
 def parse_proxy_line(line):
-# ... (function body remains the same)
     """解析 proxy.txt 中的一行内容。"""
     parts = line.strip().split(',')
     if len(parts) >= 4:
@@ -337,18 +175,14 @@ def parse_proxy_line(line):
     return None
 
 def format_proxy_line(proxy_data):
-# ... (function body remains the same)
     """格式化代理数据为 proxy.txt 行格式。"""
     return f"{proxy_data['url']},{proxy_data['latency']:.2f},{proxy_data['retries']},{proxy_data['info']}\n"
 
-
 def test_single_proxy(proxy_url, retry_count, retry_delay_seconds):
-# ... (function body remains the same)
     """
-    测试单个代理的可达性和延迟。
+    测试单个代理的可达性和延迟（使用 HTTP 探测）。
     返回: (is_success, latency_ms)
     """
-    global config
     proxies = {}
     if proxy_url.startswith('socks://') or proxy_url.startswith('socks5://') or proxy_url.startswith('socks5h://'):
         proxy_url = re.sub(r'socks(5h|5)?://', 'socks5h://', proxy_url)
@@ -356,7 +190,6 @@ def test_single_proxy(proxy_url, retry_count, retry_delay_seconds):
     elif proxy_url.startswith('http://') or proxy_url.startswith('socks4://'):
         proxies = {'http': proxy_url, 'https': proxy_url}
     else:
-        log_print(f"代理验证线程：代理格式不支持，跳过测试：{proxy_url}", is_debug=True)
         return False, None
     
     match = re.search(r'://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)', proxy_url)
@@ -379,8 +212,8 @@ def test_single_proxy(proxy_url, retry_count, retry_delay_seconds):
                 break
             else:
                 log_print(f"代理验证线程：代理 {proxy_url} 第 {attempt} 次尝试验证失败，状态码：{response.status_code}。")
-        except Exception as e:
-            log_print(f"代理验证线程：代理 {proxy_url} 第 {attempt} 次尝试验证失败，错误：{e}。")
+        except Exception:
+            log_print(f"代理验证线程：代理 {proxy_url} 第 {attempt} 次尝试验证失败（连接超时/错误）。")
         
         if attempt < retry_count:
             time.sleep(retry_delay_seconds)
@@ -391,18 +224,13 @@ def test_single_proxy(proxy_url, retry_count, retry_delay_seconds):
     return is_successful, latency
 
 def validate_proxies():
-# ... (function body remains the same)
-    """
-    验证 proxy.txt 和本地配置中的代理，并根据规则更新 proxy.txt 文件。
-    """
-    global PROXY_LIST, LOCAL_PROXY_LIST, config
+    """验证 proxy.txt 和本地配置中的代理，并根据规则更新 proxy.txt 文件。"""
+    global PROXY_LIST, LOCAL_PROXY_LIST
     
     validated_list_from_file = []
-    
     proxy_file_records = []
     seen_urls = {}
-    unprocessed_lines = [] 
-    
+    unprocessed_lines = []
     PROXY_CONTENT_CHANGED = False 
     original_file_content = ""
     
@@ -412,7 +240,7 @@ def validate_proxies():
             original_file_content = "".join(original_lines) 
             
             for line in original_lines:
-                line = line.rstrip('\n') 
+                line = line.rstrip('\n')
                 stripped_line = line.strip()
 
                 if stripped_line.startswith('#'):
@@ -425,10 +253,9 @@ def validate_proxies():
                     data['is_commented'] = False
                     data['original_retries'] = data['retries'] 
                     url = data['url']
-                    
                     seen_urls[url] = data
                 else:
-                    if stripped_line: 
+                    if stripped_line:
                          unprocessed_lines.append(line + '\n') 
                 
         proxy_file_records = list(seen_urls.values())
@@ -446,7 +273,6 @@ def validate_proxies():
     
     for record in proxy_file_records:
         original_retries = record.pop('original_retries') 
-        
         is_success, latency = test_single_proxy(
             record['url'], 
             requests_retry_count, 
@@ -492,7 +318,7 @@ def validate_proxies():
                     pass
 
         updated_proxy_records.append(record)
-    
+
     processed_content = ""
     for record in updated_proxy_records:
         line = format_proxy_line(record) 
@@ -510,13 +336,18 @@ def validate_proxies():
 
             log_print(f"代理验证线程：{PROXY_FILE} 已更新，共 {len(updated_proxy_records)} 条有效代理记录被处理。")
         except Exception as e:
-            log_print(f"错误：写入 {PROXY_FILE} 文件失败：{e}")
+            log_print(f"错误：写入 {PROXY_FILE} 文件失败：{e}", force_print=True)
     else:
-        log_print(f"代理验证线程：{PROXY_FILE} 内容无变化，跳过文件写入。") 
+        log_print(f"代理验证线程：{PROXY_FILE} 内容无变化，跳过文件写入。")
+
 
     local_proxy_list = []
     if config['local_proxies']['enable'].lower() == 'yes':
-        local_proxy_list = config['local_proxies']['proxies']
+        local_proxies_str = config['local_proxies'].get('proxies', '')
+        if isinstance(local_proxies_str, str):
+            local_proxy_list = [p.strip() for p in local_proxies_str.split(',') if p.strip()]
+        elif isinstance(local_proxies_str, list):
+            local_proxy_list = local_proxies_str
     
     validated_list_from_local = []
     
@@ -540,30 +371,12 @@ def validate_proxies():
         validated_list_from_local.sort(key=lambda x: x['latency'])
         LOCAL_PROXY_LIST = [item['proxies'] for item in validated_list_from_local]
         log_print(f"代理验证线程：全局列表更新完成。共{len(PROXY_LIST)}个外部代理，{len(LOCAL_PROXY_LIST)}个本地代理")
-        
+
 # --- VPN Gate 列表 ---
 
-def check_network(timeout=5):
-    """
-    使用纯 Python ICMP 报文检测网络连接是否正常。
-    """
-    global config
-    ping_ip = config['general']['ping_check_ip']
-    log_print(f"主线程：正在使用 ICMP 报文 ping {ping_ip} 检测网络连接...")
-    
-    latency = pure_python_icmp_ping(ping_ip, timeout=timeout) 
-    
-    if latency is not None:
-        log_print(f"主线程：网络连接正常 (延迟: {latency:.2f}ms)。")
-        return True
-    else:
-        log_print(f"主线程：网络连接异常，ICMP ping {ping_ip} 失败。")
-        return False
-
 def fetch_vpngate_list():
-# ... (function body remains the same)
     """从 VPN Gate 获取服务器列表并格式化。"""
-    global VPN_GATE_LIST, config
+    global VPN_GATE_LIST
     url = config['general']['vpngate_url']
     try:
         proxies = None
@@ -615,7 +428,7 @@ def fetch_vpngate_list():
             
             def get_ping_value(vpn_entry):
                 try:
-                    return int(vpn_entry[3])
+                    return int(vpn_entry[3]) 
                 except (ValueError, IndexError):
                     return float('inf')
 
@@ -629,12 +442,172 @@ def fetch_vpngate_list():
         log_print("获取VPN列表线程：VPN列表已按配置文件中的国家/地区和Ping值排序。")
 
     except Exception as e:
-        log_print(f"获取VPN列表线程：获取列表失败，错误：{e}")
+        log_print(f"获取VPN列表线程：获取列表失败，错误：{e}", force_print=True)
 
-# --- OpenVPN 连接逻辑 ---
+
+# --- ICMP/Socket Ping 辅助函数 ---
+
+def checksum(source_string):
+    """
+    计算ICMP校验和
+    """
+    sum_ = 0
+    max_count = (len(source_string) // 2) * 2
+    count = 0
+    while count < max_count:
+        # 注意: Python的struct.pack('!H', val)会生成网络字节序 (大端)
+        # 这里需要按字节处理，所以直接使用索引并转换为整数
+        val = source_string[count + 1] * 256 + source_string[count]
+        sum_ = sum_ + val
+        sum_ = sum_ & 0xffffffff 
+        count = count + 2
+
+    if max_count < len(source_string):
+        sum_ = sum_ + source_string[-1]
+        sum_ = sum_ & 0xffffffff
+
+    sum_ = (sum_ >> 16) + (sum_ & 0xffff)
+    sum_ = sum_ + (sum_ >> 16)
+    answer = ~sum_ & 0xffff
+    # 转换为网络字节序 (大端)
+    answer = answer >> 8 | (answer << 8 & 0xff00)
+    return answer
+
+def ping_icmp(host, timeout=3.0):
+    """
+    使用原始套接字发送和接收ICMP Echo请求。
+    返回: 延迟 (ms) 或 False
+    """
+    try:
+        # 获取目标IP
+        dest_addr = socket.gethostbyname(host)
+    except socket.gaierror:
+        return False
+        
+    icmp_socket = None
+    try:
+        # 创建原始套接字 (需要root权限)
+        icmp_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        icmp_socket.settimeout(timeout)
+    except socket.error as e:
+        # 无法创建原始套接字，通常是因为权限不足
+        log_print(f"ICMP Ping：创建原始套接字失败，可能需要root权限：{e}", force_print=True)
+        return False
+
+    ICMP_ECHO_REQUEST = 8 # ICMP类型: Echo Request
+    ICMP_CODE = 0
+    
+    # 随机ID，防止同时运行多个ping时混淆响应
+    current_id = os.getpid() & 0xFFFF 
+    sequence = 1
+    
+    # 数据载荷（可选，这里用8字节数据）
+    payload = struct.pack("d", time.time()) 
+    
+    # 1. 构造ICMP头部（先填0校验和）
+    # 类型(8), 代码(8), 校验和(16), 标识符(16), 序列号(16)
+    header = struct.pack('!bbHhH', ICMP_ECHO_REQUEST, ICMP_CODE, 0, current_id, sequence)
+    
+    # 2. 计算校验和
+    data = header + payload
+    my_checksum = checksum(data)
+    
+    # 3. 重新构造头部，填入正确校验和
+    header = struct.pack('!bbHhH', ICMP_ECHO_REQUEST, ICMP_CODE, my_checksum, current_id, sequence)
+    
+    packet = header + payload
+    
+    send_time = time.time()
+    try:
+        icmp_socket.sendto(packet, (dest_addr, 1)) # 端口号在ICMP中被忽略，但需要传入
+    except socket.error as e:
+        log_print(f"ICMP Ping：发送数据包失败：{e}", force_print=False)
+        if icmp_socket: icmp_socket.close()
+        return False
+
+    # 接收响应
+    while True:
+        # select 实现超时等待
+        ready = select.select([icmp_socket], [], [], timeout)
+        receive_time = time.time()
+        
+        if ready[0] == []:
+            # 超时
+            if icmp_socket: icmp_socket.close()
+            return False 
+
+        # 接收数据
+        packet, addr = icmp_socket.recvfrom(1024)
+        
+        # 解析ICMP头部 (20字节的IP头部后是8字节的ICMP头部)
+        icmp_header = packet[20:28]
+        icmph = struct.unpack('!bbHhH', icmp_header)
+        icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_sequence = icmph
+
+        if icmp_type == 0 and icmp_id == current_id: # ICMP Type 0 是 Echo Reply
+            latency = (receive_time - send_time) * 1000 
+            if icmp_socket: icmp_socket.close()
+            return latency 
+        
+        # 忽略非 Echo Reply 的包，继续等待或超时
+        if icmp_type != ICMP_ECHO_REQUEST:
+             pass
+             
+    if icmp_socket: icmp_socket.close()
+    return False
+
+def icmp_checker_thread_loop():
+    """持续执行ICMP Ping，解析延迟并更新 NETWORK_HEALTH_STATUS。"""
+    global NETWORK_HEALTH_STATUS
+    host = config['general']['ping_check_ip']
+    
+    # 使用一个固定的短间隔进行连续 ping，以提供最新状态
+    ping_interval = 1.0 
+    
+    log_print(f"持续ICMP监控：启动ICMP Ping监控到 {host}...")
+
+    while ICMP_RUNNING:
+        start_time = time.time()
+        
+        # ICMP Ping timeout
+        latency = ping_icmp(host, timeout=3.0) 
+
+        with NETWORK_HEALTH_LOCK:
+            if latency is not False:
+                # 记录延迟 (ms)
+                NETWORK_HEALTH_STATUS = latency 
+            else:
+                # 记录失败
+                NETWORK_HEALTH_STATUS = False
+        
+        # 打印状态（在debug模式下）
+        if latency is not False:
+            log_print(f"持续ICMP监控：Ping成功, 延迟: {latency:.2f}ms")
+        else:
+            log_print(f"持续ICMP监控：Ping失败.")
+
+        # 确保循环间隔保持在 ping_interval
+        elapsed_time = time.time() - start_time
+        sleep_time = ping_interval - elapsed_time
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        else:
+             # 如果ping耗时超过间隔，立即进行下一次ping
+             pass
+
+    log_print("持续ICMP监控：ICMP监控线程已终止。")
+
+# 移除 cleanup_ping_process, start_continuous_ping, ping_output_reader_thread
+# get_network_health 保持不变
+def get_network_health():
+    """读取并返回 NETWORK_HEALTH_STATUS 的布尔值结果。"""
+    global NETWORK_HEALTH_STATUS
+    with NETWORK_HEALTH_LOCK:
+        return NETWORK_HEALTH_STATUS is not False
+        
+# --- OpenVPN 连接逻辑 (已修正) ---
 
 def create_ovpn_file(vpn_info):
-# ... (function body remains the same)
     """根据VPN列表记录生成.ovpn配置文件。"""
     try:
         base64_config = vpn_info[14]
@@ -672,110 +645,107 @@ def create_ovpn_file(vpn_info):
         log_print(f"OpenVPN连接线程：已生成配置文件 {ovpn_filename}")
         return ovpn_filename
     except Exception as e:
-        log_print(f"OpenVPN连接线程：生成配置文件失败，错误：{e}")
+        log_print(f"OpenVPN连接线程：生成配置文件失败，错误：{e}", force_print=True)
         return None
 
 def connect_openvpn():
-# ... (function body remains the same)
     """OpenVPN连接线程，尝试连接列表中的VPN。"""
-    global OPENVPN_PROCESS, NETWORK_FAILURE_COUNT, config
+    global OPENVPN_PROCESS
     
-    with VPN_LIST_LOCK:
-        current_list = VPN_GATE_LIST[:]
-    
-    if not current_list:
-        log_print("OpenVPN连接线程：VPN列表为空，无法连接。")
+    # 关键 1：尝试获取连接锁
+    if not OPENVPN_CONNECT_LOCK.acquire(blocking=False):
+        log_print("OpenVPN连接线程：上一个连接或清理线程仍在运行，跳过本次连接尝试。")
         return
 
-    log_print("OpenVPN连接线程：正在尝试连接VPN...")
-    
-    for i, vpn_info in enumerate(current_list):
-        log_print(f"OpenVPN连接线程：尝试连接第 {i+1} 条记录 ({vpn_info[0]}, {vpn_info[6]}，原始Ping: {vpn_info[3]}ms)")
-        ovpn_file = create_ovpn_file(vpn_info)
+    try: 
+        with VPN_LIST_LOCK:
+            current_list = VPN_GATE_LIST[:]
         
-        if not ovpn_file:
-            continue
-            
-        try:
-            if OPENVPN_PROCESS:
-                log_print("OpenVPN连接线程：正在终止旧的OpenVPN进程...")
-                pgid = None
-                
-                try:
-                    pgid = os.getpgid(OPENVPN_PROCESS.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-                    log_print(f"已发送 SIGTERM 到进程组 {pgid}，等待退出...")
-                except ProcessLookupError:
-                    log_print("旧进程已消失，无需终止。")
-                except Exception as e:
-                    log_print(f"终止旧进程时出现错误 (SIGTERM)：{e}")
-                
-                try:
-                    OPENVPN_PROCESS.wait(timeout=10) 
-                    log_print("旧进程已优雅退出。")
-                except subprocess.TimeoutExpired:
-                    log_print("旧进程超时未退出，尝试强制终止 (SIGKILL)...")
-                    if pgid:
-                        try:
-                            os.killpg(pgid, signal.SIGKILL)
-                            OPENVPN_PROCESS.wait(timeout=5)
-                        except ProcessLookupError:
-                            pass 
-                        except Exception as e:
-                            log_print(f"强制终止旧进程时出现错误 (SIGKILL)：{e}")
-                
-                OPENVPN_PROCESS = None
-            
-            OPENVPN_PROCESS = subprocess.Popen(
-                ['openvpn', '--config', ovpn_file],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid 
-            )
-            
-            log_print("OpenVPN连接线程：等待 tun0 接口出现...")
-            success = False
-            for _ in range(60):
-                if os.path.exists('/sys/class/net/tun0'):
-                    success = True
-                    break
-                time.sleep(1)
+        if not current_list:
+            log_print("OpenVPN连接线程：VPN列表为空，无法连接。", force_print=True)
+            return
 
-            if not success:
-                log_print("OpenVPN连接线程：60秒内未检测到 tun0 接口，连接可能失败。")
-                
-                if OPENVPN_PROCESS:
-                    pgid = os.getpgid(OPENVPN_PROCESS.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                    OPENVPN_PROCESS.wait()
-                    OPENVPN_PROCESS = None
+        log_print("OpenVPN连接线程：正在尝试连接VPN...")
+        
+        for i, vpn_info in enumerate(current_list):
+            log_print(f"OpenVPN连接线程：尝试连接第 {i+1} 条记录 ({vpn_info[0]}, {vpn_info[6]}，原始Ping: {vpn_info[3]}ms)")
+            ovpn_file = create_ovpn_file(vpn_info)
+            
+            if not ovpn_file:
                 continue
-            else:
-                log_print("OpenVPN连接线程：tun0 接口已就绪。")
-
-            log_print("OpenVPN连接线程：等待网络稳定和连通性（最多30秒重试）...")
-            
-            network_ok = False
-            max_checks = 10 
-            check_delay = 3
-            
-            for attempt in range(max_checks):
-                if check_network(timeout=5): 
-                    network_ok = True
-                    break
-                log_print(f"OpenVPN连接线程：网络检查失败 (尝试 {attempt + 1}/{max_checks})，等待 {check_delay} 秒重试...")
-                time.sleep(check_delay)
-
-            if network_ok:
-                avg_latency = ping_test_average_latency(host=config['general']['ping_check_ip'], count=5)
                 
-                if avg_latency is not None:
-                    NETWORK_FAILURE_COUNT = 0 
+            try:
+                # --- 进程终止和清理 START ---
+                if OPENVPN_PROCESS:
+                    log_print("OpenVPN连接线程：正在终止旧的OpenVPN进程...")
+                    pgid = None
+                    try:
+                        pgid = os.getpgid(OPENVPN_PROCESS.pid)
+                        os.killpg(pgid, signal.SIGTERM) 
+                    except ProcessLookupError:
+                        pass
+                    except Exception as e:
+                        log_print(f"终止旧进程时出现错误 (SIGTERM)：{e}")
                     
-                    log_print(f"OpenVPN连接线程：连接成功，VPN [{vpn_info[0]}] 正常工作，平均延迟：{avg_latency:.2f} ms。")
+                    try:
+                        OPENVPN_PROCESS.wait(timeout=10) 
+                        log_print("旧进程已优雅退出。")
+                    except subprocess.TimeoutExpired:
+                        log_print("旧进程超时未退出，尝试强制终止 (SIGKILL)...")
+                        if pgid:
+                            try:
+                                os.killpg(pgid, signal.SIGKILL)
+                                OPENVPN_PROCESS.wait(timeout=5)
+                            except:
+                                pass
                     
+                    OPENVPN_PROCESS = None
+                # --- 进程终止和清理 END ---
+                
+                # 启动新进程
+                OPENVPN_PROCESS = subprocess.Popen(
+                    ['openvpn', '--config', ovpn_file],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    preexec_fn=os.setsid
+                )
+                
+                log_print("OpenVPN连接线程：等待 tun0 接口出现...")
+                success = False
+                for _ in range(60):
+                    if os.path.exists('/sys/class/net/tun0'):
+                        success = True
+                        break
+                    time.sleep(1)
+
+                if not success:
+                    log_print("OpenVPN连接线程：60秒内未检测到 tun0 接口，连接可能失败。")
+                    
+                    if OPENVPN_PROCESS:
+                        pgid = os.getpgid(OPENVPN_PROCESS.pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                        OPENVPN_PROCESS.wait()
+                        OPENVPN_PROCESS = None
+                    continue
+                else:
+                    log_print("OpenVPN连接线程：tun0 接口已就绪。")
+
+                # 检查网络（等待 5 秒，然后读取持续 Ping 的状态）
+                log_print("OpenVPN连接线程：tun0 已就绪，等待 5 秒确认连接稳定...")
+                time.sleep(5) 
+
+                if get_network_health(): 
+                    
+                    current_latency = None
+                    with NETWORK_HEALTH_LOCK:
+                        current_latency = NETWORK_HEALTH_STATUS if NETWORK_HEALTH_STATUS is not False else None
+                        
+                    latency_str = f"{current_latency:.2f} ms" if current_latency else "未知延迟"
+                    
+                    log_print(f"OpenVPN连接线程：连接成功，VPN [{vpn_info[0]}] 正常工作，网络检查通过 (延迟: {latency_str})。")
+                    
+                    # 准备通知信息
                     proxy_str = "N/A"
-                    
                     if os.path.exists(ovpn_file):
                         try:
                             with open(ovpn_file, 'r') as f:
@@ -795,7 +765,7 @@ def connect_openvpn():
                             log_print(f"OpenVPN连接线程：读取配置文件失败，错误：{e}")
                     
                     url_msg = f"已连接{vpn_info[0]}({vpn_info[6]}) 原始Ping:{vpn_info[3]}ms"
-                    url_ping_info = f" 平均延迟:{avg_latency:.2f}ms"
+                    url_ping_info = f" 网络检查通过 (延迟: {latency_str})"
                     url_proxy_info = f" 通过代理:{proxy_str}"
                     
                     full_url = f"http://192.168.1.1:81/?phone=test&msg={url_msg}{url_ping_info}{url_proxy_info}&from=VPNGATE"
@@ -804,166 +774,122 @@ def connect_openvpn():
                     try :
                         requests.get(full_url, timeout=5)
                     except Exception as e :
-                        log_print(f"发送SMS失败{e}")
+                        log_print(f"发送SMS失败{e}", force_print=True)
                 
-                return 
-            else:
-                log_print(f"OpenVPN连接线程：VPN [{vpn_info[0]}] 连接后网络异常，尝试下一条。")
-                
+                    return # 连接成功，退出循环
+                else:
+                    log_print(f"OpenVPN连接线程：VPN [{vpn_info[0]}] 连接后网络异常（5秒延迟后持续ICMP Ping未恢复），尝试下一条。")
+                    
+                    if OPENVPN_PROCESS:
+                        pgid = os.getpgid(OPENVPN_PROCESS.pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                        OPENVPN_PROCESS.wait()
+                        OPENVPN_PROCESS = None
+                    continue
+
+            except Exception as e:
+                log_print(f"OpenVPN连接线程：连接过程中出现错误：{e}", force_print=True)
                 if OPENVPN_PROCESS:
-                    pgid = os.getpgid(OPENVPN_PROCESS.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                    OPENVPN_PROCESS.wait()
+                    try:
+                        pgid = os.getpgid(OPENVPN_PROCESS.pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                        OPENVPN_PROCESS.wait()
+                    except:
+                        pass
                     OPENVPN_PROCESS = None
-                continue
+            finally:
+                if os.path.exists(ovpn_file):
+                    os.remove(ovpn_file)
 
-        except Exception as e:
-            log_print(f"OpenVPN连接线程：连接过程中出现错误：{e}")
-            if OPENVPN_PROCESS:
-                try:
-                    pgid = os.getpgid(OPENVPN_PROCESS.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                    OPENVPN_PROCESS.wait()
-                except:
-                    pass
-                OPENVPN_PROCESS = None
-        finally:
-            if os.path.exists(ovpn_file):
-                os.remove(ovpn_file)
+        log_print("OpenVPN连接线程：所有VPN记录都连接失败。", force_print=True)
 
-    log_print("OpenVPN连接线程：所有VPN记录都连接失败。")
-
-def ping_test_average_latency(host=config['general']['ping_check_ip'], count=5):
-    """
-    使用纯 Python ICMP 报文执行多次 ping 并计算平均延迟（毫秒）。
-    """
-    log_print(f"OpenVPN连接线程：正在使用 ICMP 报文 ping {host} 获取平均延迟 ({count}次)...")
-    
-    latencies = []
-    
-    for i in range(count):
-        latency = pure_python_icmp_ping(host, timeout=5)
-        if latency is not None:
-            latencies.append(latency)
-        time.sleep(0.5) 
-
-    if not latencies:
-        log_print("OpenVPN连接线程：ICMP ping 失败，未获得任何有效延迟数据。")
-        return None
+    except Exception as e:
+        log_print(f"OpenVPN连接线程：在连接循环外部发生错误：{e}", force_print=True)
         
-    avg_latency = sum(latencies) / len(latencies)
-    log_print(f"OpenVPN连接线程：平均网络延迟为 {avg_latency:.2f} ms。")
-    return avg_latency
+    finally:
+        # 关键 2：确保在函数结束时释放锁
+        if OPENVPN_CONNECT_LOCK.locked():
+            OPENVPN_CONNECT_LOCK.release()
+            log_print("OpenVPN连接线程：连接/清理循环结束，已释放连接锁。")
+
 
 # --- 线程循环 ---
 
-def load_config():
-    """从配置文件加载配置，如果文件不存在则创建默认文件。"""
-    global LAST_CONFIG_MOD_TIME, config
-    config_parser = configparser.ConfigParser()
+def network_checker_loop():
+    """
+    定时检查线程。
+    检查后台状态（NETWORK_HEALTH_STATUS）来决定是否调用 connect_openvpn()。
+    """
+    global OPENVPN_PROCESS
+    interval = int(config['general']['network_checker_interval_seconds'])
     
-    # 初始化 config 字典
-    for section, defaults in DEFAULT_CONFIG.items():
-        config.setdefault(section, {}).update(defaults)
+    log_print("网络检查线程：首次启动，尝试连接VPN。")
+    threading.Thread(target=connect_openvpn).start()
 
-    if os.path.exists(CONFIG_FILE):
-        config_parser.read(CONFIG_FILE)
-        log_print("已成功加载 vpngate.cfg 配置文件。")
-    else:
-        # 写入默认配置
-        config_parser['general'] = DEFAULT_CONFIG['general']
-        config_parser['vpngate'] = DEFAULT_CONFIG['vpngate']
-        config_parser['local_proxies'] = DEFAULT_CONFIG['local_proxies'] 
-        with open(CONFIG_FILE, 'w') as f:
-            config_parser.write(f)
-        log_print(f"配置文件 {CONFIG_FILE} 不存在，已创建默认文件。")
-    
-    # 1. 记录加载前的 debug 状态
-    old_debug_mode = str(config['general'].get('debug_mode', 'no')).lower()
-
-    # 更新全局 config 字典
-    for section in config_parser.sections():
-        for key, value in config_parser.items(section):
-            config[section][key] = value
-
-    config['vpngate']['country_codes'] = [code.strip() for code in config['vpngate']['country_codes'].split(',')]
-    filter_patterns = [keyword.strip() for keyword in config['vpngate']['hostname_filter_keywords'].split(',') if keyword.strip()]
-    config['vpngate']['hostname_filter_patterns'] = [re.compile(pattern, re.IGNORECASE) for pattern in filter_patterns]
-    
-    local_proxies_str = config['local_proxies'].get('proxies', '')
-    config['local_proxies']['proxies'] = [p.strip() for p in local_proxies_str.split(',') if p.strip()]
-
-    # 检查并打印调试模式状态
-    
-    # 3. 检查并打印调试模式状态
-    new_debug_mode = str(config['general'].get('debug_mode', 'no')).lower()
-    
-    if new_debug_mode != old_debug_mode:
-        if new_debug_mode == 'yes':
-            log_print("调试模式已开启。", is_debug=False) 
-        else:
-            log_print("调试模式已关闭。", is_debug=False) 
-
-    try:
-        config['general']['proxy_retry_count'] = int(config['general']['proxy_retry_count'])
-        config['general']['proxy_retry_delay_seconds'] = int(config['general']['proxy_retry_delay_seconds'])
-    except (ValueError, KeyError) as e:
-        log_print(f"警告：配置文件中代理重试参数格式错误，将使用默认值。错误：{e}")
-        config['general']['proxy_retry_count'] = 3
-        config['general']['proxy_retry_delay_seconds'] = 1
-
-def main_thread_loop():
-# ... (function body remains the same)
-    """主线程循环，定期检测网络。"""
-    global config
     while True:
-        if not check_network():
-            log_print("主线程：网络异常，正在调用OpenVPN连接线程...")
-            vpn_thread = threading.Thread(target=connect_openvpn)
-            vpn_thread.start()
-            vpn_thread.join()
+        time.sleep(interval)
+        
+        # 移除 PING_PROCESS 检查/重启逻辑
+             
+        network_ok = get_network_health()
+        
+        if network_ok:
+            current_latency = None
+            with NETWORK_HEALTH_LOCK:
+                 current_latency = NETWORK_HEALTH_STATUS
+                 
+            latency_msg = f"(延迟约 {current_latency:.2f} ms)" if current_latency is not False else ""
+            log_print(f"网络检查线程：持续ICMP Ping显示网络正常 {latency_msg}。") # UPDATED message
+        else:
+            log_print("网络检查线程：检测到网络连接失败 (持续ICMP Ping无响应或失败)。") # UPDATED message
             
-        time.sleep(int(config['general']['network_check_interval_seconds']))
+            if not OPENVPN_CONNECT_LOCK.locked() and (OPENVPN_PROCESS or os.path.exists('/sys/class/net/tun0')):
+                log_print("网络检查线程：检测到网络异常，开始清理旧连接并触发重连。")
+                
+                reconnect_thread = threading.Thread(target=connect_openvpn)
+                reconnect_thread.start()
+            elif OPENVPN_CONNECT_LOCK.locked():
+                 log_print("网络检查线程：网络异常，但连接线程正在运行，等待其完成。")
+            else:
+                log_print("网络检查线程：网络异常，但无活动 VPN 进程，启动连接。")
+                reconnect_thread = threading.Thread(target=connect_openvpn)
+                reconnect_thread.start()
+
 
 def vpn_list_thread_loop():
-# ... (function body remains the same)
     """获取VPN列表线程循环，定期更新列表。"""
-    global config
     while True:
         time.sleep(int(config['general']['vpngate_update_interval_seconds']))
-        log_print(f"VPN列表线程：定期更新VPN列表，间隔 {config['general']['vpngate_update_interval_seconds']} 秒。", is_debug=True) 
+        log_print(f"VPN列表线程：定期更新VPN列表，间隔 {config['general']['vpngate_update_interval_seconds']} 秒。")
         fetch_vpngate_list()
 
 def proxy_list_thread_loop():
-# ... (function body remains the same)
     """代理列表线程循环，定期更新并验证代理。"""
-    global config
     while True:
         time.sleep(int(config['general']['proxy_update_interval_seconds']))
-        log_print(f"代理线程：定期验证代理，间隔 {config['general']['proxy_update_interval_seconds']} 秒。", is_debug=True) 
+        log_print(f"代理线程：定期验证代理，间隔 {config['general']['proxy_update_interval_seconds']} 秒。")
         validate_proxies()
 
 def config_watcher_thread():
-# ... (function body remains the same)
-    """新线程：每分钟检查配置文件变动，并触发相关更新。"""
-    global LAST_CONFIG_MOD_TIME, LAST_PROXY_MOD_TIME, config
-
+    """检查配置文件变动。"""
+    global LAST_CONFIG_MOD_TIME, LAST_PROXY_MOD_TIME
     try:
         if os.path.exists(CONFIG_FILE):
             LAST_CONFIG_MOD_TIME = os.path.getmtime(CONFIG_FILE)
         if os.path.exists(PROXY_FILE):
             LAST_PROXY_MOD_TIME = os.path.getmtime(PROXY_FILE)
     except FileNotFoundError:
-        pass 
+        pass
 
+    interval = config.get('general', {}).get('config_check_interval_seconds', 300)
+    try:
+        interval = int(interval)
+    except:
+        interval = 300
+    
     while True:
-        try:
-            interval = int(config['general']['config_check_interval_seconds'])
-        except (KeyError, ValueError):
-            interval = 300
-            
-        time.sleep(interval) 
-        log_print("配置监控线程：正在检查配置文件变动...", is_debug=True) 
+        time.sleep(interval)
+        log_print("配置监控线程：正在检查配置文件变动...")
         
         try:
             current_config_mod_time = os.path.getmtime(CONFIG_FILE)
@@ -973,7 +899,7 @@ def config_watcher_thread():
                 fetch_vpngate_list()
                 LAST_CONFIG_MOD_TIME = current_config_mod_time
         except FileNotFoundError:
-            log_print("配置监控线程：vpngate.cfg 文件不存在，跳过检查。", is_debug=True) 
+            pass
 
         try:
             current_proxy_mod_time = os.path.getmtime(PROXY_FILE)
@@ -982,33 +908,92 @@ def config_watcher_thread():
                 validate_proxies()
                 LAST_PROXY_MOD_TIME = current_proxy_mod_time
         except FileNotFoundError:
-            log_print("配置监控线程：proxy.txt 文件不存在，跳过检查。", is_debug=True) 
+            pass
+
+def load_config():
+    """从配置文件加载配置，如果文件不存在则创建默认文件。"""
+    global LAST_CONFIG_MOD_TIME
+    
+    # 获取旧的 debug 状态
+    old_debug_state_str = config['general'].get('debug', 'false')
+    old_debug_state = old_debug_state_str.lower() in ('true', 'yes', '1')
+
+    config_parser = configparser.ConfigParser()
+    if os.path.exists(CONFIG_FILE):
+        config_parser.read(CONFIG_FILE)
+        # 这里使用强制打印，因为这是重要的初始化或重载信息
+        log_print("已成功加载 vpngate.cfg 配置文件。")
+    else:
+        default_config_parser = configparser.ConfigParser()
+        default_config_parser['general'] = {k: str(v) for k, v in config['general'].items()}
+        default_config_parser['vpngate'] = config['vpngate']
+        default_config_parser['local_proxies'] = config['local_proxies'] 
+        with open(CONFIG_FILE, 'w') as f:
+            default_config_parser.write(f)
+        log_print(f"配置文件 {CONFIG_FILE} 不存在，已创建默认文件。")
+
+    new_config = config.copy() 
+    for section in config_parser.sections():
+        new_config.setdefault(section, {}).update(config_parser.items(section))
+    config.update(new_config)
+
+    # 检查 debug 状态变化
+    new_debug_state_str = config['general'].get('debug', 'false')
+    new_debug_state = new_debug_state_str.lower() in ('true', 'yes', '1')
+    
+    if new_debug_state != old_debug_state:
+        # 强制打印 DEBUG 模式变更信息
+        log_print(f"DEBUG模式变更为: {new_debug_state}", force_print=True)
+
+    # 处理 country_codes 和 filter_patterns
+    config['vpngate']['country_codes'] = [code.strip() for code in config['vpngate']['country_codes'].split(',')]
+    filter_patterns = [keyword.strip() for keyword in config['vpngate']['hostname_filter_keywords'].split(',') if keyword.strip()]
+    config['vpngate']['hostname_filter_patterns'] = [re.compile(pattern, re.IGNORECASE) for pattern in filter_patterns]
+    
+    local_proxies_str = config['local_proxies'].get('proxies', '')
+    if isinstance(local_proxies_str, str):
+        config['local_proxies']['proxies'] = [p.strip() for p in local_proxies_str.split(',') if p.strip()]
+
+    try:
+        config['general']['proxy_retry_count'] = int(config['general']['proxy_retry_count'])
+        config['general']['proxy_retry_delay_seconds'] = int(config['general']['proxy_retry_delay_seconds'])
+        config['general']['network_checker_interval_seconds'] = int(config['general']['network_checker_interval_seconds'])
+    except (ValueError, KeyError) as e:
+        log_print(f"警告：配置文件中参数格式错误，将使用默认值。错误：{e}", force_print=True)
+        config['general']['proxy_retry_count'] = 3
+        config['general']['proxy_retry_delay_seconds'] = 1
+        config['general']['network_checker_interval_seconds'] = 30
+
 
 # --- 主程序入口 ---
 if __name__ == '__main__':
-    # 尝试导入 socket 模块，如果失败则退出
-    # if 'socket' not in sys.modules: 
-    try:
-        import socket
-    except ImportError:
-        print("错误：缺少 socket 模块。无法执行纯 Python ICMP Ping。")
-        sys.exit(1)
-
     load_config()
     if not read_default_gateway():
+        log_print("未读取到默认网关，程序退出。", force_print=True)
         exit(1)
 
     validate_proxies()
     
     if not PROXY_LIST and not LOCAL_PROXY_LIST:
-        log_print("程序启动：未找到有效代理，程序退出。请检查 proxy.txt 文件和 vpngate.cfg 中的本地代理配置。")
+        log_print("程序启动：未找到有效代理，程序退出。请检查 proxy.txt 文件和 vpngate.cfg 中的本地代理配置。", force_print=True)
         exit(1)
     
-    log_print("程序启动，正在初始化线程...")
+    log_print("程序启动，正在初始化线程...", force_print=True)
     
     fetch_vpngate_list()
     
     # 启动所有线程
+    
+    # NEW: 启动 ICMP 监控线程
+    ICMP_RUNNING = True 
+    icmp_monitor_thread = threading.Thread(target=icmp_checker_thread_loop) 
+    icmp_monitor_thread.daemon = True
+    icmp_monitor_thread.start()
+
+    checker_thread = threading.Thread(target=network_checker_loop)
+    checker_thread.daemon = True
+    checker_thread.start()
+    
     vpn_list_thread = threading.Thread(target=vpn_list_thread_loop)
     vpn_list_thread.daemon = True
     vpn_list_thread.start()
@@ -1021,21 +1006,17 @@ if __name__ == '__main__':
     config_watcher.daemon = True
     config_watcher.start()
     
-    # 启动 VPN 监控线程
-    vpn_monitor = threading.Thread(target=vpn_monitor_thread_loop)
-    vpn_monitor.daemon = True
-    vpn_monitor.start()
-    
-    main_thread = threading.Thread(target=main_thread_loop)
-    main_thread.daemon = True
-    main_thread.start()
-    
-    log_print("所有线程已启动。")
+    log_print("所有线程已启动。", force_print=True)
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log_print("\n程序终止。")
+        log_print("\n程序终止。", force_print=True)
+        
+        # NEW: 清理 ICMP 线程
+        ICMP_RUNNING = False 
+        
+        # 移除 cleanup_ping_process() 调用
         if OPENVPN_PROCESS:
             try:
                 os.killpg(os.getpgid(OPENVPN_PROCESS.pid), signal.SIGTERM)
