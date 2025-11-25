@@ -516,10 +516,15 @@ def ping_output_reader_thread():
                 if match:
                     latency = float(match.group(1))
                     NETWORK_HEALTH_STATUS = latency 
-                elif 'Destination Host Unreachable' in line or 'Network is unreachable' in line or 'unknown host' in line:
+                    LAST_PING_UPDATE_TIME = time.time() 
+                    log_print(f"Ping读取线程：Ping成功，延迟 {latency:.2f}ms。") # 增加Debug日志
+                # 匹配不可达的输出，格式如 "8.8.8.8 : unreachable" 或 DNS 错误
+                elif 'unreachable' in line or 'can\'t resolve' in line: # <-- 关键修改
                     NETWORK_HEALTH_STATUS = False 
+                    LAST_PING_UPDATE_TIME = time.time()
+                    log_print(f"Ping读取线程：Ping失败，目标不可达或解析失败。") # 增加Debug日志
                 else:
-                    pass 
+                    pass
                 
         except Exception as e:
             log_print(f"Ping读取线程：读取输出或解析时出错：{e}")
